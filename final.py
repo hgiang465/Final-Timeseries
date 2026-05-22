@@ -1,26 +1,8 @@
 """
 =============================================================================
-PHÂN TÍCH VÀ DỰ BÁO GIÁ DẦU THÔ BRENT – PHIÊN BẢN HOÀN CHỈNH v3
+BRENT CRUDE OIL ANALYSIS AND FORECASTING
 =============================================================================
-Danh sách lỗi đã sửa so với v2:
 
-  BUG 1 ✅ (NGHIÊM TRỌNG) – Python substring: "DUNG" in "KHONG DUNG" = True
-         Sửa: dùng biến boolean is_stationary riêng, không dùng 'in' với string
-
-  BUG 2 ✅ (NGHIÊM TRỌNG) – Engle-Granger không chạy vì level_results sai
-         Sửa: logic is_stationary đúng → EG test được thực thi đầy đủ
-
-  BUG 3 ✅ (SAI VỀ Ý NGHĨA) – PLS variance > 100% (PLS1=148%, PLS2=123%)
-         Sửa: tính % variance đúng cách theo x-scores của từng component
-
-  BUG 4 ✅ (CHỈ SỐ VÔ NGHĨA) – MAPE bùng nổ khi OIL_RET ≈ 0
-         Sửa: thay MAPE bằng QLIKE (Quasi-Likelihood) và thêm Theil's U
-              Vẫn giữ MAPE với epsilon-threshold để so sánh, nhưng dùng
-              MAE + RMSE + QLIKE làm tiêu chí chính
-
-  THÊM ✅ – Kiểm định ARCH LM riêng trên chuỗi loại outlier COVID-19
-  THÊM ✅ – Dirichlet U (Theil's U2) làm chỉ số đánh giá bổ sung
-=============================================================================
 """
 import warnings, os
 warnings.filterwarnings("ignore")
@@ -37,26 +19,30 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 plt.rcParams.update({
-    "figure.facecolor": "white", "axes.facecolor": "#f8f9fa",
-    "axes.grid": True, "grid.alpha": 0.35, "font.family": "DejaVu Sans",
+    "figure.facecolor": "white", "axes.facecolor": "white",
+    "axes.grid": False, "grid.alpha": 0.35, "font.family": "DejaVu Sans",
     "axes.titlesize": 11, "axes.labelsize": 9,
 })
 PALETTE = ["#9467bd","#8c564b","#e377c2","#7f7f7f",
            "#bcbd22","#17becf","#aec7e8","#ffbb78","#98df8a","#ff9896"]
 
 # =============================================================================
-# 0. LÀM SẠCH & GHÉP DỮ LIỆU
+# 0. CLEANING & MERGING DATA
 # =============================================================================
 print("\n" + "="*70)
-print("PHAN 0 – LAM SACH & GHEP DU LIEU")
+print("PART 0 – CLEANING & MERGING DATA")
 print("="*70)
 
+base_dir = os.path.dirname(os.path.abspath(__file__))
+raw_dir = os.path.join(base_dir, "Raw_data")
+out_dir = os.path.join(base_dir, "Out_put")
+os.makedirs(out_dir, exist_ok=True)
 files = {
-    "OIL": "D:\\PYTHON\\SUBJECTS\\Timeseries\\Finalproject\\Final-Timeseries\\DCOILBRENTEU (2).xlsx",
-    "CPI": "D:\\PYTHON\\SUBJECTS\\Timeseries\\Finalproject\\Final-Timeseries\\CPIAUCSL.xlsx",
-    "USD": "D:\\PYTHON\\SUBJECTS\\Timeseries\\Finalproject\\Final-Timeseries\\DTWEXBGS.xlsx",
-    "FED": "D:\\PYTHON\\SUBJECTS\\Timeseries\\Finalproject\\Final-Timeseries\\FEDFUNDS.xlsx",
-    "IND": "D:\\PYTHON\\SUBJECTS\\Timeseries\\Finalproject\\Final-Timeseries\\INDPRO.xlsx",
+    "OIL": os.path.join(raw_dir, "DCOILBRENTEU (2).xlsx"),
+    "CPI": os.path.join(raw_dir, "CPIAUCSL.xlsx"),
+    "USD": os.path.join(raw_dir, "DTWEXBGS.xlsx"),
+    "FED": os.path.join(raw_dir, "FEDFUNDS.xlsx"),
+    "IND": os.path.join(raw_dir, "INDPRO.xlsx"),
 }
 col_map = {"DCOILBRENTEU": "OIL", "CPIAUCSL": "CPI",
            "DTWEXBGS": "USD", "FEDFUNDS": "FED", "INDPRO": "IND"}
@@ -74,21 +60,21 @@ df_raw.ffill(limit=3, inplace=True)
 df_raw.bfill(limit=3, inplace=True)
 df_raw.dropna(inplace=True)
 
-print(f"Khoang thoi gian : {df_raw.index[0].date()} -> {df_raw.index[-1].date()}")
-print(f"So quan sat (raw): {len(df_raw)}")
+print(f"Date range : {df_raw.index[0].date()} -> {df_raw.index[-1].date()}")
+print(f"Number of observations (raw): {len(df_raw)}")
 
 # =============================================================================
-# 1. KIỂM ĐỊNH TÍNH DỪNG: ADF + KPSS
+# 1. STATIONARITY TESTS: ADF + KPSS
 # =============================================================================
 print("\n" + "="*70)
-print("PHAN 1 – KIEM DINH TINH DUNG: ADF + KPSS")
+print("PART 1 – STATIONARITY TESTS: ADF + KPSS")
 print("="*70)
 
 # ── ADF ───────────────────────────────────────────────────────────────────────
 def adf_test(y, maxlag=None):
     """
-    ADF test – H0: có đơn vị gốc (không dừng)
-    → p < 0.05: bác bỏ H0 → chuỗi DỪNG
+    ADF test – H0: unit root (non-stationary)
+    → p < 0.05: reject H0 → series STATIONARY
     """
     y = np.asarray(y, dtype=float)
     n = len(y)
@@ -128,8 +114,8 @@ def adf_test(y, maxlag=None):
 # ── KPSS ──────────────────────────────────────────────────────────────────────
 def kpss_test(y, lags=None):
     """
-    KPSS test – H0: chuỗi DỪNG
-    → p < 0.05: bác bỏ H0 → chuỗi KHÔNG DỪNG
+    KPSS test – H0: series is STATIONARY
+    → p < 0.05: reject H0 → series NON-STATIONARY
     Critical values (level): 0.347 (10%), 0.463 (5%), 0.574 (2.5%), 0.739 (1%)
     """
     y = np.asarray(y, dtype=float)
@@ -154,39 +140,29 @@ def kpss_test(y, lags=None):
     else:                        p_approx = 0.01
     return kpss_stat, p_approx
 
-
-# ── Kết luận tổng hợp – BUG 1 ĐÃ SỬA ────────────────────────────────────────
-# PHIÊN BẢN CŨ (SAI):
-#   level_results[col] = {..., "stationary": "DUNG" in decision}
-#   → "DUNG" in "KHONG DUNG" = True  ← Python kiểm tra substring!
-#   → tất cả biến bị đánh dấu stationary=True, EG test bị bỏ qua toàn bộ
-#
-# PHIÊN BẢN MỚI (ĐÚNG):
-#   Dùng biến boolean is_stat riêng biệt, không dựa vào string matching
-
 def stationarity_decision(adf_p, kpss_p):
     """
-    Trả về (is_stationary: bool, label: str)
-    ADF  H0: non-stat → p<0.05 reject → DỪNG
-    KPSS H0: stat     → p<0.05 reject → KHÔNG DỪNG
+    Return (is_stationary: bool, label: str)
+    ADF  H0: non-stat → p<0.05 reject → STATIONARY
+    KPSS H0: stat     → p<0.05 reject → NON-STATIONARY
     """
     adf_reject  = (adf_p  < 0.05)   # True = DỪNG theo ADF
     kpss_accept = (kpss_p >= 0.05)  # True = DỪNG theo KPSS (không bác bỏ H0)
 
     if adf_reject and kpss_accept:
-        return True,  "DUNG ✅"
+        return True,  "STATIONARY ✅"
     elif adf_reject and not kpss_accept:
-        return True,  "Co the dung ⚠️"   # ADF bác bỏ nhưng KPSS nghi ngờ → xem thêm
+        return True,  "POSSIBLY STATIONARY ⚠️"   
     else:
-        return False, "KHONG DUNG ❌"
+        return False, "NON-STATIONARY ❌"
 
 
 # ──────────────────────── Level ─────────────────────────────────────────────
 level_cols = ["OIL", "USD", "CPI", "FED", "IND"]
 
 print(f"\n[LEVEL]")
-print(f"{'Bien':<10} {'ADF_stat':>10} {'ADF_p':>8} {'KPSS_stat':>10} "
-      f"{'KPSS_p':>8} {'Ket luan':<22} {'I(d)'}")
+print(f"{'Variable':<10} {'ADF_stat':>10} {'ADF_p':>8} {'KPSS_stat':>10} "
+    f"{'KPSS_p':>8} {'Conclusion':<22} {'I(d)'}")
 print("-"*76)
 
 level_results = {}
@@ -194,10 +170,10 @@ for col in level_cols:
     series = df_raw[col].dropna().values
     adf_s, adf_p, _  = adf_test(series)
     kpss_s, kpss_p   = kpss_test(series)
-    is_stat, label   = stationarity_decision(adf_p, kpss_p)   # ← BUG 1 FIX
+    is_stat, label   = stationarity_decision(adf_p, kpss_p)   
     level_results[col] = {
         "adf_p": adf_p, "kpss_p": kpss_p,
-        "is_stationary": is_stat   # boolean tường minh, KHÔNG dùng string
+        "is_stationary": is_stat  
     }
     order = "I(0)" if is_stat else "I(1)"
     print(f"{col:<10} {adf_s:>10.4f} {adf_p:>8.4f} {kpss_s:>10.4f} "
@@ -209,9 +185,9 @@ for col in level_cols:
     diff_df[f"{col}_RET"] = np.log(df_raw[col] / df_raw[col].shift(1))
 diff_df.dropna(inplace=True)
 
-print(f"\n[LOG-RETURN (sai phan bac 1 cua log)]")
-print(f"{'Bien':<12} {'ADF_stat':>10} {'ADF_p':>8} {'KPSS_stat':>10} "
-      f"{'KPSS_p':>8} {'Ket luan':<22} {'I(d)'}")
+print(f"\n[LOG-RETURN (first-difference of log)]")
+print(f"{'Variable':<12} {'ADF_stat':>10} {'ADF_p':>8} {'KPSS_stat':>10} "
+    f"{'KPSS_p':>8} {'Conclusion':<22} {'I(d)'}")
 print("-"*78)
 
 diff_results = {}
@@ -220,36 +196,36 @@ for col in level_cols:
     series = diff_df[rc].values
     adf_s, adf_p, _  = adf_test(series)
     kpss_s, kpss_p   = kpss_test(series)
-    is_stat, label   = stationarity_decision(adf_p, kpss_p)   # ← BUG 1 FIX
+    is_stat, label   = stationarity_decision(adf_p, kpss_p)  
     diff_results[rc] = {
         "adf_p": adf_p, "kpss_p": kpss_p,
         "is_stationary": is_stat
     }
     note = ""
     if rc == "CPI_RET" and kpss_p < 0.15:
-        note = " [KPSS gan nguong]"
+        note = " [KPSS near threshold]"
     order = "I(0)" if is_stat else "I(1)*"
     print(f"{rc:<12} {adf_s:>10.4f} {adf_p:>8.4f} {kpss_s:>10.4f} "
           f"{kpss_p:>8.4f} {label:<22} {order}{note}")
 
 print("""
-[CHU THICH]
-  ADF  H0: co don vi goc → p<0.05 bac bo → DUNG
-  KPSS H0: dung          → p<0.05 bac bo → KHONG DUNG
-  Ket hop: ADF bac bo + KPSS khong bac bo = CHAC CHAN DUNG
-  CPI_RET: KPSS gan nguong 5% → tinh dung yeu hon, can theo doi
+[NOTE]
+    ADF  H0: unit root → p<0.05 reject → STATIONARY
+    KPSS H0: stationary → p<0.05 reject → NON-STATIONARY
+    Combination: ADF reject + KPSS not reject = LIKELY STATIONARY
+    CPI_RET: KPSS near 5% → weaker stationarity, monitor
 """)
 
 # =============================================================================
-# 2. KIỂM ĐỊNH ĐỒNG LIÊN KẾT ENGLE-GRANGER (BUG 2 ĐÃ SỬA)
+# 2. COINTEGRATION TEST (ENGLE-GRANGER)
 # =============================================================================
 print("\n" + "="*70)
-print("PHAN 2 – KIEM DINH DONG LIEN KET (Engle-Granger)")
+print("PART 2 – COINTEGRATION TEST (Engle-Granger)")
 print("="*70)
 print("""
-[MUC DICH]
-Neu OIL va bien giai thich deu I(1), kiem dinh xem chung co dong lien ket khong.
-Neu co: nen dung ECM. Neu khong: dung log-return (bien sai phan) la hop le.
+[PURPOSE]
+If OIL and explanatory variables are I(1), test whether they are cointegrated.
+If cointegrated: consider ECM. If not: using log-returns (stationary) is appropriate.
 """)
 
 def engle_granger_coint(y, x):
@@ -274,20 +250,11 @@ def engle_granger_coint(y, x):
 
 exo_for_coint = ["USD", "CPI", "FED", "IND"]
 
-# ── BUG 2 FIX: dùng is_stationary boolean ─────────────────────────────────
-# PHIÊN BẢN CŨ (SAI):
-#   non_stationary_levels = [c for c in level_cols if not level_results[c]["stationary"]]
-#   → "stationary" key lưu kết quả từ "DUNG" in decision (đã sai ở Bug 1)
-#   → toàn bộ biến bị coi là stationary → list I(1) rỗng → EG test không chạy
-#
-# PHIÊN BẢN MỚI (ĐÚNG):
-#   Dùng is_stationary boolean từ stationarity_decision()
-
 non_stationary_levels = [c for c in level_cols
-                         if not level_results[c]["is_stationary"]]   # ← BUG 2 FIX
+                         if not level_results[c]["is_stationary"]]   
 
-print(f"Cac bien I(1) (level khong dung): {non_stationary_levels}")
-print(f"\n{'Cap bien':<22} {'EG stat':>10} {'p-value':>10} {'Lag':>5} {'Ket luan'}")
+print(f"I(1) variables (non-stationary levels): {non_stationary_levels}")
+print(f"\n{'Pair':<22} {'EG stat':>10} {'p-value':>10} {'Lag':>5} {'Conclusion'}")
 print("-"*72)
 
 coint_pairs = {}
@@ -304,32 +271,32 @@ for col in exo_for_coint:
         )
         coint = (p_eg < 0.05)
         coint_pairs[col] = {"stat": stat, "p": p_eg,
-                            "cointegrated": coint, "beta": beta}
-        conclusion = "CO dong lien ket ✅" if coint else "Khong co ❌"
+                    "cointegrated": coint, "beta": beta}
+        conclusion = "Cointegrated ✅" if coint else "Not cointegrated ❌"
         print(f"OIL ~ {col:<16} {stat:>10.4f} {p_eg:>10.4f} {lag:>5}  {conclusion}")
     elif oil_stat or col_stat:
-        print(f"OIL ~ {col:<16} {'(bo qua: mot hoac hai bien da dung)':>52}")
+        print(f"OIL ~ {col:<16} {'(skipped: one or both variables stationary)':>52}")
 
 if not eg_ran:
-    print("  [CANH BAO] Khong co cap nao du dieu kien I(1)+I(1) → EG test bi bo qua")
-    print("  → Tat ca bien level deu duoc phan loai la I(0) hoac chua ro rang")
+    print("  [WARNING] No pairs satisfy I(1)+I(1) → EG test skipped")
+    print("  → All level variables are I(0) or unclear")
 
-# Hướng xử lý dựa trên kết quả EG
+# Action plan based on EG results
 has_coint = any(v["cointegrated"] for v in coint_pairs.values()) if coint_pairs else False
 print(f"""
-[KET QUA & HUONG XU LY]
-  EG test chay: {'Co' if eg_ran else 'Khong (khong co cap I(1)+I(1))'}
-  Co dong lien ket: {'Co – nen xem xet ECM' if has_coint else 'Khong – dung log-return la hop le'}
-  => QUYET DINH: Su dung LOG-RETURN (bien dung I(0)) cho toan bo mo hinh.
-     Ly do: (1) Tranh spurious regression. (2) Phu hop voi mo hinh du bao ngan han.
-             (3) Log-return co y nghia kinh te: % thay doi gia.
+[RESULTS & ACTION]
+    EG test ran: {'Yes' if eg_ran else 'No (no I(1)+I(1) pairs)'}
+    Cointegration present: {'Yes – consider ECM' if has_coint else 'No – use log-returns'}
+    => DECISION: Use LOG-RETURN (stationary I(0)) for all models.
+         Reasons: (1) Avoid spurious regression. (2) Suitable for short-term forecasting.
+                         (3) Log-return has economic meaning: % price change.
 """)
 
 # =============================================================================
-# 3. THỐNG KÊ MÔ TẢ
+# 3. DESCRIPTIVE STATISTICS
 # =============================================================================
 print("\n" + "="*70)
-print("PHAN 3 – THONG KE MO TA (TREN BIEN DUNG)")
+print("PART 3 – DESCRIPTIVE STATISTICS (ON STATIONARY VARS)")
 print("="*70)
 
 df_all = diff_df.copy()
@@ -340,20 +307,20 @@ desc = df_all[cols_d].describe().T
 desc["skewness"] = df_all[cols_d].skew()
 desc["kurtosis"] = df_all[cols_d].kurt()
 print(desc.round(4).to_string())
-print("\n[GHI CHU] OIL_RET: kurtosis=34 → phan phoi duoi rat day, phu hop GARCH")
-print("          FED_RET: kurtosis=48, IND_RET: kurtosis=64 → outlier COVID-19 (2020)")
+print("\n[NOTE] OIL_RET: kurtosis=34 → heavy tails, suitable for GARCH")
+print("       FED_RET: kurtosis=48, IND_RET: kurtosis=64 → COVID-19 outlier (2020)")
 
 # Figure 1
 fig1, axes = plt.subplots(3, 2, figsize=(14, 12))
-fig1.suptitle("Tong quan du lieu – Level vs Log-Return (chuan dung)",
+fig1.suptitle("Data overview – Level vs Log-Return (stationary)",
               fontsize=13, fontweight="bold")
 pairs = [
-    ("OIL",     "Gia dau Brent – Level (I(1), tham khao)", "#1f77b4"),
-    ("OIL_RET", "OIL Log-Return – DUNG I(0) ✅",           "#ff7f0e"),
-    ("USD_RET", "USD Log-Return – DUNG I(0) ✅",           "#2ca02c"),
-    ("CPI_RET", "CPI Log-Return – DUNG I(0) ✅",           "#d62728"),
-    ("FED_RET", "FED Log-Return – DUNG I(0) ✅",           "#9467bd"),
-    ("IND_RET", "IND Log-Return – DUNG I(0) ✅",           "#8c564b"),
+    ("OIL",     "Brent Price – Level (I(1), reference)", "#1f77b4"),
+    ("OIL_RET", "OIL Log-Return – STATIONARY I(0) ",     "#ff7f0e"),
+    ("USD_RET", "USD Log-Return – STATIONARY I(0) ",     "#2ca02c"),
+    ("CPI_RET", "CPI Log-Return – STATIONARY I(0) ",     "#d62728"),
+    ("FED_RET", "FED Log-Return – STATIONARY I(0) ",     "#9467bd"),
+    ("IND_RET", "IND Log-Return – STATIONARY I(0) ",     "#8c564b"),
 ]
 for ax, (col, title, color) in zip(axes.flatten(), pairs):
     ax.plot(df_all.index, df_all[col], color=color, lw=1.0)
@@ -362,38 +329,38 @@ for ax, (col, title, color) in zip(axes.flatten(), pairs):
     ax.xaxis.set_major_locator(mdates.YearLocator(3))
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
 plt.tight_layout()
-plt.savefig("Fig1_Overview_Stationary.png", dpi=150, bbox_inches="tight")
+plt.savefig(os.path.join(out_dir, "Fig1_Overview_Stationary.png"), dpi=150, bbox_inches="tight")
 plt.close()
-print("[Da luu] Fig1_Overview_Stationary.png")
+print(f"[Saved] {os.path.join(out_dir, 'Fig1_Overview_Stationary.png')}")
 
 # Figure – Stationarity comparison
 fig_s, axes_s = plt.subplots(2, 5, figsize=(18, 7))
-fig_s.suptitle("Kiem dinh tinh dung: Level (KHONG DUNG) vs Log-Return (DUNG)",
+fig_s.suptitle("Stationarity check: Level (NON-STATIONARY) vs Log-Return (STATIONARY)",
                fontsize=13, fontweight="bold")
 colors_lv = ["#d62728","#ff7f0e","#9467bd","#8c564b","#2ca02c"]
 for i, col in enumerate(level_cols):
     ax_l = axes_s[0, i]; ax_r = axes_s[1, i]
     ax_l.plot(df_raw.index, df_raw[col], color=colors_lv[i], lw=0.9)
-    ax_l.set_title(f"{col} Level\n(I(1) – KHONG DUNG ❌)", fontsize=8.5, color="#d62728")
+    ax_l.set_title(f"{col} Level\n(I(1) – NON-STATIONARY ❌)", fontsize=8.5, color="#d62728")
     ax_l.xaxis.set_major_locator(mdates.YearLocator(5))
     plt.setp(ax_l.xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=7)
     rc = f"{col}_RET"
     ax_r.plot(df_all.index, df_all[rc], color=colors_lv[i], lw=0.9)
-    ax_r.set_title(f"{rc}\n(I(0) – DUNG ✅)", fontsize=8.5, color="#2ca02c")
+    ax_r.set_title(f"{rc}\n(I(0) – STATIONARY ✅)", fontsize=8.5, color="#2ca02c")
     ax_r.xaxis.set_major_locator(mdates.YearLocator(5))
     plt.setp(ax_r.xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=7)
-axes_s[0, 0].set_ylabel("Level (goc)", fontsize=9)
-axes_s[1, 0].set_ylabel("Log-Return (dung)", fontsize=9)
+axes_s[0, 0].set_ylabel("Level (raw)", fontsize=9)
+axes_s[1, 0].set_ylabel("Log-Return (stationary)", fontsize=9)
 plt.tight_layout()
-plt.savefig("Fig_Stationarity.png", dpi=150, bbox_inches="tight")
+plt.savefig(os.path.join(out_dir, "Fig_Stationarity.png"), dpi=150, bbox_inches="tight")
 plt.close()
-print("[Da luu] Fig_Stationarity.png")
+print(f"[Saved] {os.path.join(out_dir, 'Fig_Stationarity.png')}")
 
 # =============================================================================
-# 4. KIỂM ĐỊNH ARCH LM + ACF/PACF
+# 4. ARCH LM TEST + ACF/PACF
 # =============================================================================
 print("\n" + "="*70)
-print("PHAN 4 – KIEM DINH ARCH LM + ACF/PACF")
+print("PART 4 – ARCH LM TEST + ACF/PACF")
 print("="*70)
 
 def arch_lm(resid, nlags=12):
@@ -412,20 +379,19 @@ ret = df_all["OIL_RET"].values
 
 # ARCH LM trên toàn chuỗi
 lm_s, lm_p = arch_lm(ret)
-print(f"\nARCH LM – toan chuan (lag=12): stat={lm_s:.4f}  p={lm_p:.6f}  "
-      f"→ {'Co ARCH effect' if lm_p < 0.05 else 'Khong ARCH'}")
+print(f"\nARCH LM – full sample (lag=12): stat={lm_s:.4f}  p={lm_p:.6f}  "
+    f"→ {'ARCH effect' if lm_p < 0.05 else 'No ARCH'}")
 
 # ARCH LM loại outlier COVID-19 (tháng 3–5/2020)
 covid_mask = ~((df_all.index.year == 2020) & (df_all.index.month.isin([3,4,5])))
 ret_no_covid = df_all.loc[covid_mask, "OIL_RET"].values
 lm_s2, lm_p2 = arch_lm(ret_no_covid)
-print(f"ARCH LM – loai COVID (lag=12):  stat={lm_s2:.4f}  p={lm_p2:.6f}  "
-      f"→ {'Co ARCH effect' if lm_p2 < 0.05 else 'Khong ARCH'}")
+print(f"ARCH LM – excluding COVID outliers (lag=12):  stat={lm_s2:.4f}  p={lm_p2:.6f}  "
+    f"→ {'ARCH effect' if lm_p2 < 0.05 else 'No ARCH'}")
 print("""
-[GHI CHU] Outlier COVID-19 (T3-T5/2020: OIL_RET min=-1.24) co the che giau
-  ARCH effect trong test toan chuan. Ket qua sau khi loai outlier phan anh
-  tinh chat bien dong cua chuan OIL tot hon.
-  => GARCH/ARCH van duoc giu trong pipeline de bao phu ca truong hop co ARCH effect.
+[NOTE] COVID-19 outlier (Mar-May 2020) may mask ARCH effect in full-sample test.
+    Results after excluding the outlier better reflect the dynamics of OIL_RET.
+    => Keep GARCH/ARCH in the pipeline to cover cases with ARCH effects.
 """)
 
 def manual_acf(x, n=30):
@@ -435,7 +401,7 @@ def manual_acf(x, n=30):
 
 cb = 1.96 / np.sqrt(len(ret))
 fig2, axes = plt.subplots(2, 2, figsize=(14, 8))
-fig2.suptitle("ACF & PACF – OIL_RET (chuan dung I(0))", fontsize=13, fontweight="bold")
+fig2.suptitle("ACF & PACF – OIL_RET (stationary I(0))", fontsize=13, fontweight="bold")
 
 def plot_bar(ax, vals, title):
     ax.bar(range(len(vals)), vals, color="#1f77b4", width=0.4)
@@ -450,18 +416,18 @@ ret_p = np.diff(ret_a[:15], prepend=ret_a[0])[:15]
 e2_p  = np.diff(e2_a[:15], prepend=e2_a[0])[:15]
 plot_bar(axes[0, 0], ret_a, "ACF – OIL_RET")
 plot_bar(axes[0, 1], ret_p, "PACF – OIL_RET")
-plot_bar(axes[1, 0], e2_a,  "ACF – OIL_RET² (kiem tra ARCH effect)")
+plot_bar(axes[1, 0], e2_a,  "ACF – OIL_RET² (check ARCH effect)")
 plot_bar(axes[1, 1], e2_p,  "PACF – OIL_RET²")
 plt.tight_layout()
-plt.savefig("Fig2_ACF_PACF.png", dpi=150, bbox_inches="tight")
+plt.savefig(os.path.join(out_dir, "Fig2_ACF_PACF.png"), dpi=150, bbox_inches="tight")
 plt.close()
-print("[Da luu] Fig2_ACF_PACF.png")
+print(f"[Saved] {os.path.join(out_dir, 'Fig2_ACF_PACF.png')}")
 
 # =============================================================================
-# 5. GIẢM CHIỀU PLS (BUG 3 ĐÃ SỬA)
+# 5. DIMENSION REDUCTION: PLS (ON STATIONARY VARIABLES)
 # =============================================================================
 print("\n" + "="*70)
-print("PHAN 5 – GIAM CHIEU: PLS (tren bien DUNG)")
+print("PART 5 – DIMENSION REDUCTION: PLS (on stationary variables)")
 print("="*70)
 
 exo_cols = ["USD_RET", "CPI_RET", "FED_RET", "IND_RET"]
@@ -477,19 +443,7 @@ pls.fit(X_sc, y_raw_)
 X_pls = pls.transform(X_sc)   # shape (n, N_COMP)
 pls_cols = [f"PLS{i+1}" for i in range(N_COMP)]
 
-# ── BUG 3 FIX: tính variance đúng cách ────────────────────────────────────
-# PHIÊN BẢN CŨ (SAI):
-#   var_pct = np.var(X_pls, axis=0) / np.var(X_sc).sum() * 100
-#   → np.var(X_sc).sum() = tổng variance scalar của toàn ma trận X_sc đã chuẩn hóa
-#     = số features (=4 vì StandardScaler đặt mỗi feature var=1)
-#   → np.var(X_pls, axis=0) / 4 có thể > 1 nếu PLS scores tương quan với y
-#   → kết quả vô nghĩa: 148%, 123%
-#
-# PHIÊN BẢN MỚI (ĐÚNG):
-#   Tính % variance của X được giải thích bởi từng PLS component
-#   Dùng x-loadings (W*) và công thức projection đúng
 
-# Variance của từng cột X_sc (đã chuẩn hóa → mỗi cột = 1, tổng = n_features)
 total_var_X = X_sc.shape[1]   # = 4 (mỗi feature có var=1 sau StandardScaler)
 
 # Reconstruct từng component và tính % variance giải thích được
@@ -507,24 +461,23 @@ total_var_scores = np.sum([np.var(X_pls[:, k]) * X_sc.shape[1]
                            for k in range(N_COMP)])
 var_pct = np.array(var_explained) / sum(var_explained) * 100   # % trong tổng đã giải thích
 
-print(f"Components: {N_COMP} | Bien exog (chuan hoa): {exo_cols}")
+print(f"Components: {N_COMP} | Exogenous vars (standardized): {exo_cols}")
 print(f"\n{'Comp':<8} {'Var explained':>15} {'%':>8} {'Cum%':>8}")
 print("-"*42)
 cum = 0
 for i, (v, p) in enumerate(zip(var_explained, var_pct)):
     cum += p
     print(f"PLS{i+1:<5} {v:>15.6f} {p:>8.2f}% {cum:>7.2f}%")
-print(f"\n[GHI CHU] % variance la ty le trong tong variance da duoc PLS giai thich.")
-print(f"  Tat ca gia tri <= 100% (tong = 100%). Khi truoc: PLS1=148%, PLS2=123% (SAI)")
+print(f"  All variance shares sum to 100%. Previously reported values were incorrect.")
 
 df_pls   = pd.DataFrame(X_pls, index=df_all.index, columns=pls_cols)
 df_model = df_all[["OIL", "OIL_RET"]].join(df_pls)
 
 # =============================================================================
-# 6. CHIA TRAIN / TEST
+# 6. TRAIN / TEST
 # =============================================================================
 print("\n" + "="*70)
-print("PHAN 6 – CHIA TRAIN / TEST (75% / 25%)")
+print("PART 6 – TRAIN / TEST SPLIT (75% / 25%)")
 print("="*70)
 
 n = len(df_model); n_train = int(n * 0.75)
@@ -536,10 +489,10 @@ print(f"Test : {df_test.index[0].date()}  -> {df_test.index[-1].date()}  ({len(d
 print(f"\n✅ Toan bo mo hinh chay tren OIL_RET (I(0)) → Tranh Spurious Regression")
 
 # =============================================================================
-# 7. MÔ HÌNH
+# 7. MODELING
 # =============================================================================
 print("\n" + "="*70)
-print("PHAN 7 – UOC LUONG & DU BAO")
+print("PART 7 – ESTIMATION & FORECASTING")
 print("="*70)
 
 results_fc = {}
@@ -685,23 +638,11 @@ print(f"     GARCHX(1,1): mu={mu_gx:.6f}  alpha={al_gx[0]:.4f}  "
       f"beta={be_gx[0]:.4f}  persist={al_gx[0]+be_gx[0]:.4f}")
 
 # =============================================================================
-# 8. ĐÁNH GIÁ – BUG 4 ĐÃ SỬA
+# 8. EVALUATION: MAE, RMSE, QLIKE, Theil-U2
 # =============================================================================
 print("\n" + "="*70)
-print("PHAN 8 – DANH GIA: MAE, RMSE, QLIKE, Theil-U2")
+print("PART 8 – EVALUATION: MAE, RMSE, QLIKE, Theil-U2")
 print("="*70)
-print("""
-[BUG 4 DA SUA] MAPE bi loai bo khoi chi so chinh vi:
-  - OIL_RET co nhieu gia tri ~ 0 (thang it bien dong)
-  - MAPE = |actual-forecast| / |actual| → vo cuc khi actual ≈ 0
-  - Ket qua cu: OLS/PLS-Reg MAPE=196%, ARIMA MAPE=100% → vo nghia
-
-THAY THE:
-  MAE   : sai so tuyet doi trung binh (chi so chinh)
-  RMSE  : phat nang outlier (chi so chinh)
-  QLIKE : Quasi-Likelihood, uu dieu voi GARCH, khong bi anh huong boi ret≈0
-  TheilU2: Theil's U2 so sanh voi naive forecast (< 1 = tot hon naive)
-""")
 
 def qlike(actual, forecast):
     """
@@ -777,37 +718,37 @@ for i, (m, r) in enumerate(df_rank.iterrows()):
 
 best_rmse  = df_perf.index[0]
 best_total = df_rank.index[0]
-print(f"\nTot nhat theo RMSE: {best_rmse}")
-print(f"Tot nhat tong hop : {best_total}")
+print(f"\nBest by RMSE: {best_rmse}")
+print(f"Best overall : {best_total}")
 
 # Figure 3 – Forecast comparison
 fig3, axes = plt.subplots(2, 1, figsize=(15, 10))
-fig3.suptitle("Du bao ngoai mau – OIL_RET (bien dung I(0))",
+fig3.suptitle("Out-of-sample Forecasts – OIL_RET (stationary I(0))",
               fontsize=13, fontweight="bold")
 ax = axes[0]
-ax.plot(df_test.index, y_test, color="black", lw=2, label="Thuc te", zorder=5)
+ax.plot(df_test.index, y_test, color="black", lw=2, label="Actual", zorder=5)
 for i, (m, fc) in enumerate(results_fc.items()):
     ax.plot(df_test.index, fc, ls="-" if i < 5 else "--",
             color=PALETTE[i % len(PALETTE)], lw=1.1, alpha=0.85, label=m)
-ax.set_title("Tat ca mo hinh"); ax.set_ylabel("OIL_RET")
+ax.set_title("All models"); ax.set_ylabel("OIL_RET")
 ax.legend(fontsize=7.5, ncol=2, loc="upper right")
 
 ax2 = axes[1]
-ax2.plot(df_test.index, y_test, color="black", lw=2, label="Thuc te", zorder=5)
+ax2.plot(df_test.index, y_test, color="black", lw=2, label="Actual", zorder=5)
 for i, m in enumerate(df_perf.index[:3]):
     ax2.plot(df_test.index, results_fc[m], color=PALETTE[i], lw=1.6,
              label=f"{m}  RMSE={df_perf.loc[m,'RMSE']:.5f}  "
                    f"U2={df_perf.loc[m,'TheilU2']:.3f}")
-ax2.set_title("Top-3 mo hinh (theo RMSE)"); ax2.set_ylabel("OIL_RET")
+ax2.set_title("Top-3 models (by RMSE)"); ax2.set_ylabel("OIL_RET")
 ax2.legend(fontsize=9, loc="upper right")
 plt.tight_layout()
-plt.savefig("Fig3_Forecast.png", dpi=150, bbox_inches="tight")
+plt.savefig(os.path.join(out_dir, "Fig3_Forecast.png"), dpi=150, bbox_inches="tight")
 plt.close()
-print("\n[Da luu] Fig3_Forecast.png")
+print(f"\n[Saved] {os.path.join(out_dir, 'Fig3_Forecast.png')}")
 
 # Figure 4 – Performance bar (không có MAPE)
 fig4, axes = plt.subplots(1, 4, figsize=(18, 5))
-fig4.suptitle("So sanh hieu qua du bao – Bien dung I(0)", fontsize=13, fontweight="bold")
+fig4.suptitle("Forecast performance comparison – Stationary I(0)", fontsize=13, fontweight="bold")
 bc = [PALETTE[i % len(PALETTE)] for i in range(len(df_perf))]
 for ax, metric in zip(axes, ["MAE", "RMSE", "QLIKE", "TheilU2"]):
     vals = df_perf[metric]
@@ -820,18 +761,18 @@ for ax, metric in zip(axes, ["MAE", "RMSE", "QLIKE", "TheilU2"]):
         ax.text(v * 1.01, bar.get_y() + bar.get_height() / 2,
                 f"{v:.4f}", va="center", fontsize=7.5)
 plt.tight_layout()
-plt.savefig("Fig4_Performance.png", dpi=150, bbox_inches="tight")
+plt.savefig(os.path.join(out_dir, "Fig4_Performance.png"), dpi=150, bbox_inches="tight")
 plt.close()
-print("[Da luu] Fig4_Performance.png")
+print(f"[Saved] {os.path.join(out_dir, 'Fig4_Performance.png')}")
 
 # Figure 5 – GARCH volatility
 fig5, axes = plt.subplots(2, 1, figsize=(14, 8))
-fig5.suptitle(f"GARCH(1,1) – Bien dong co dieu kien  "
+fig5.suptitle(f"GARCH(1,1) – Conditional volatility  "
               f"(α={al_g[0]:.4f}, β={be_g[0]:.4f}, "
               f"persist={al_g[0]+be_g[0]:.4f})",
               fontsize=12, fontweight="bold")
 axes[0].plot(df_train.index, y_train, color="#1f77b4", lw=0.9)
-axes[0].set_title("OIL_RET – Train set (bien dung I(0))")
+axes[0].set_title("OIL_RET – Train set (stationary I(0))")
 axes[0].set_ylabel("Log-Return")
 cv_g = np.sqrt(np.maximum(h_garch, 0))
 axes[1].fill_between(df_train.index, -cv_g, cv_g,
@@ -841,16 +782,16 @@ axes[1].set_title("Conditional Volatility – GARCH(1,1)")
 axes[1].set_ylabel("σ_t")
 axes[1].legend()
 plt.tight_layout()
-plt.savefig("Fig5_Volatility.png", dpi=150, bbox_inches="tight")
+plt.savefig(os.path.join(out_dir, "Fig5_Volatility.png"), dpi=150, bbox_inches="tight")
 plt.close()
-print("[Da luu] Fig5_Volatility.png")
+print(f"[Saved] {os.path.join(out_dir, 'Fig5_Volatility.png')}")
 
 # =============================================================================
-# 9. XUẤT EXCEL
+# 9. EXPORT EXCEL
 # =============================================================================
-out_xl = "OilAnalysis_Results_v3.xlsx"
+out_xl = os.path.join(out_dir, "OilAnalysis_Results_v3.xlsx")
 
-# Bảng stationarity đầy đủ
+# Full stationarity table
 stat_rows = []
 for col in level_cols:
     adf_s, adf_p, _ = adf_test(df_raw[col].values)
@@ -871,7 +812,7 @@ for col in level_cols:
 
 df_stat_out = pd.DataFrame(stat_rows)
 
-# Bảng cointegration
+# Cointegration table
 if coint_pairs:
     coint_rows = [{"Pair": f"OIL~{k}", "EG_stat": round(v["stat"],4),
                    "p_value": round(v["p"],4),
@@ -879,7 +820,7 @@ if coint_pairs:
                   for k, v in coint_pairs.items()]
     df_coint_out = pd.DataFrame(coint_rows)
 else:
-    df_coint_out = pd.DataFrame({"Note": ["EG test khong chay – xem console output"]})
+    df_coint_out = pd.DataFrame({"Note": ["EG test did not run – see console output"]})
 
 # PLS variance
 pls_var_df = pd.DataFrame({
@@ -900,33 +841,14 @@ with pd.ExcelWriter(out_xl, engine="openpyxl") as w:
     df_perf.round(6).to_excel(w, sheet_name="Performance_Metrics")
     df_rank[["avg_rank","MAE","RMSE","QLIKE","sMAPE(%)","TheilU2"]]\
         .round(6).to_excel(w, sheet_name="Overall_Ranking")
-print(f"[Da luu] {out_xl}")
+print(f"[Saved] {out_xl}")
 
 # =============================================================================
 # TÓM TẮT CUỐI
 # =============================================================================
 print("\n" + "="*70)
-print("TOM TAT CUOI – v3 (da sua tat ca loi)")
+print("FINAL SUMMARY")
 print("="*70)
-print(f"""
-[CAC LỖI ĐÃ SỬA]
-  ✅ BUG 1: Substring Python: "DUNG" in "KHONG DUNG" = True
-            → Dung boolean is_stationary rieng biet
-  ✅ BUG 2: EG test bi bo qua vi level_results sai
-            → Cac bien I(1): {non_stationary_levels}
-            → EG test da chay: {'Co' if eg_ran else 'Khong co cap I(1)+I(1)'}
-  ✅ BUG 3: PLS variance > 100% (148%, 123%)
-            → Tinh dung theo deflation + proportion of explained
-  ✅ BUG 4: MAPE vo nghia (100-196%) voi log-return ≈ 0
-            → Thay bang: MAE, RMSE (chinh), QLIKE, sMAPE, Theil U2
-
-[TINH DUNG]
-  ✅ ADF + KPSS: Tat ca bien _RET la I(0) (dung)
-  ✅ Cointegration (EG): da kiem dinh, ket qua trong Excel
-  ✅ Toan bo mo hinh dung OIL_RET (I(0)) → Khong co Spurious Regression
-
-[HIEU QUA DU BAO]
-""")
 print(f"   {'#':<4} {'Model':<14} {'MAE':>10} {'RMSE':>10} {'QLIKE':>8} "
       f"{'sMAPE%':>8} {'TheilU2':>9}")
 print("  " + "-"*68)
@@ -934,8 +856,5 @@ for i, (m, r) in enumerate(df_perf.iterrows()):
     star = " ← BEST RMSE" if i == 0 else ""
     print(f"   {i+1:<4} {m:<14} {r['MAE']:>10.6f} {r['RMSE']:>10.6f} "
           f"{r['QLIKE']:>8.4f} {r['sMAPE(%)']:>8.2f} {r['TheilU2']:>9.4f}{star}")
-
-print(f"\n[CHU Y] TheilU2 > 1 → tat ca mo hinh te hon naive (random walk).")
-print(f"  Day la tinh chat chung cua gia tai san tai chinh (EMH – Efficient Market).")
-print(f"  Model tot hon theo nghia: RMSE va MAE thap nhat trong nhom, U2 gan 1 nhat.")
+    
 print(f"\nHoan tat! File ket qua: {out_xl}")
