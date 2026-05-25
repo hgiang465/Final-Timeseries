@@ -602,31 +602,67 @@ def sarimax_fc_simple(y, Xtr, Xte, p, q, h):
     e_  = arma_resid(par, r, p, q)
     return arma_fc(par, r, e_, p, q, h) + Xp @ b
 
-def garch_fit_fn(r, p, q, maxiter=600):
+def garch_fit_fn(r, p, q, dist="normal", maxiter=800):
+    """
+    Fit GARCH(p,q) with either Normal or Student-t innovations.
+    dist = "normal" : Gaussian log-likelihood
+    dist = "t"      : Student-t log-likelihood (extra parameter: log(nu-2))
+    Returns: mu_hat, omega, alpha_array, beta_array, h_array, e_array,
+             [df_t]  (degrees-of-freedom only when dist="t")
+    """
+    from scipy.special import gammaln
     T = len(r); s2 = r.var(); mu0 = r.mean()
-    def nll(params):
-        mu = params[0]; om = np.exp(params[1])
-        al = np.abs(params[2:2+p]); be = np.abs(params[2+p:2+p+q])
+
+    def _build_h(params, p, q, T, s2, r):
+        mu  = params[0]
+        om  = np.exp(params[1])
+        al  = np.abs(params[2:2+p])
+        be  = np.abs(params[2+p:2+p+q])
+        # enforce stationarity: alpha+beta < 0.999
         if al.sum() + be.sum() >= 0.999:
-            sc = 0.98/(al.sum()+be.sum()+1e-9); al=al*sc; be=be*sc
-        e = r - mu; h = np.full(T, s2); ll = 0.
-        for t in range(max(p,q), T):
-            h[t] = om + sum(al[i]*e[t-1-i]**2 for i in range(p)) + \
-                       sum(be[j]*h[t-1-j]   for j in range(q))
-            h[t] = max(h[t], 1e-9)
-            ll += 0.5*(np.log(2*np.pi*h[t]) + e[t]**2/h[t])
-        return ll
-    x0 = [mu0, np.log(s2*0.1)] + [0.1]*p + [0.8]*q
+            sc = 0.98 / (al.sum() + be.sum() + 1e-9)
+            al = al * sc; be = be * sc
+        e = r - mu
+        h = np.full(T, s2)
+        for t in range(max(p, q), T):
+            h[t] = max(om + sum(al[i]*e[t-1-i]**2 for i in range(p))
+                          + sum(be[j]*h[t-1-j]    for j in range(q)), 1e-9)
+        return mu, om, al, be, e, h
+
+    if dist == "normal":
+        def nll(params):
+            mu, om, al, be, e, h = _build_h(params, p, q, T, s2, r)
+            ll = 0.
+            for t in range(max(p, q), T):
+                ll += 0.5 * (np.log(2*np.pi*h[t]) + e[t]**2 / h[t])
+            return ll
+        x0 = [mu0, np.log(s2*0.1)] + [0.1]*p + [0.8]*q
+
+    else:  # Student-t
+        # extra param: log(nu - 2), so nu = exp(x) + 2  => nu > 2
+        def nll(params):
+            mu, om, al, be, e, h = _build_h(params[:-1], p, q, T, s2, r)
+            nu = np.exp(params[-1]) + 2.0   # degrees of freedom > 2
+            ll = 0.
+            for t in range(max(p, q), T):
+                z2 = e[t]**2 / h[t]
+                # Student-t log-density (standardised)
+                ll += (0.5*np.log(h[t])
+                       - gammaln((nu+1)/2) + gammaln(nu/2)
+                       + 0.5*np.log(np.pi*(nu-2))
+                       + (nu+1)/2 * np.log(1 + z2/(nu-2)))
+            return ll
+        x0 = [mu0, np.log(s2*0.1)] + [0.1]*p + [0.8]*q + [np.log(5.0)]
+
     res = optimize.minimize(nll, x0, method="Nelder-Mead",
                             options={"maxiter": maxiter, "xatol": 1e-6, "fatol": 1e-6})
-    par = res.x; mu_hat = par[0]; om = np.exp(par[1])
-    al = np.abs(par[2:2+p]); be = np.abs(par[2+p:2+p+q])
-    if al.sum()+be.sum() >= 0.999:
-        sc = 0.98/(al.sum()+be.sum()+1e-9); al=al*sc; be=be*sc
-    e = r - mu_hat; h = np.full(T, s2)
-    for t in range(max(p,q), T):
-        h[t] = max(om+sum(al[i]*e[t-1-i]**2 for i in range(p)) +
-                      sum(be[j]*h[t-1-j]    for j in range(q)), 1e-9)
+    par = res.x
+    mu_hat, om, al, be, e, h = _build_h(
+        par if dist == "normal" else par[:-1], p, q, T, s2, r)
+
+    if dist == "t":
+        nu_hat = np.exp(par[-1]) + 2.0
+        return mu_hat, om, al, be, h, e, nu_hat
     return mu_hat, om, al, be, h, e
 
 # ── Fit all models ────────────────────────────────────────────────────────────
@@ -660,18 +696,27 @@ else:
     results_fc["SARIMA"] = results_fc["ARIMA"].copy()
     print("     (n_train<=12, fallback to ARIMA)")
 
-# --- 5. ARCH(1) ---
+# --- 5. ARCH(1) – Normal ---
 print("[8e] ARCH(1)")
-mu_a, _, _, _, h_arch, e_arch = garch_fit_fn(y_train, 1, 0)
+mu_a, _, _, _, h_arch, e_arch = garch_fit_fn(y_train, 1, 0, dist="normal")
 results_fc["ARCH(1)"] = np.full(len(y_test), mu_a)
 print(f"     mu={mu_a:.6f}  (variance model only; mean forecast = mu_hat)")
 
-# --- 6. GARCH(1,1) ---
+# --- 6. GARCH(1,1) – Normal ---
 print("[8f] GARCH(1,1)")
-mu_g, om_g, al_g, be_g, h_garch, e_garch = garch_fit_fn(y_train, 1, 1)
+mu_g, om_g, al_g, be_g, h_garch, e_garch = garch_fit_fn(y_train, 1, 1, dist="normal")
 results_fc["GARCH(1,1)"] = np.full(len(y_test), mu_g)
 print(f"     mu={mu_g:.6f}  omega={om_g:.6e}  alpha={al_g[0]:.4f}  "
       f"beta={be_g[0]:.4f}  persist={al_g[0]+be_g[0]:.4f}")
+
+# --- 6b. GARCH(1,1)-t – Student-t innovations ---
+print("[8f-t] GARCH(1,1)-t  [Student-t innovations]")
+(mu_gt, om_gt, al_gt, be_gt,
+ h_garch_t, e_garch_t, nu_gt) = garch_fit_fn(y_train, 1, 1, dist="t")
+results_fc["GARCH-t"] = np.full(len(y_test), mu_gt)
+print(f"     mu={mu_gt:.6f}  omega={om_gt:.6e}  alpha={al_gt[0]:.4f}  "
+      f"beta={be_gt[0]:.4f}  persist={al_gt[0]+be_gt[0]:.4f}  "
+      f"df(nu)={nu_gt:.2f}")
 
 # --- 7. OLS + Dummy Variables ---
 print("[8g] OLS + Dummy Variables (GFC, Oil Crash 2014, COVID-19, Ukraine War)")
@@ -730,21 +775,27 @@ def theil_u2(actual, forecast):
     rmse_n = np.sqrt(mean_squared_error(actual, naive))
     return rmse_m / max(rmse_n, 1e-10)
 
-def smape(actual, forecast):
-    denom = np.abs(actual) + np.abs(forecast)
-    mask  = denom > 1e-6
-    return np.mean(2*np.abs(actual[mask]-forecast[mask])/denom[mask])*100
+def mase(actual, forecast, y_train_ref):
+    """
+    Mean Absolute Scaled Error.
+    Scale = MAE of naive random-walk on training set.
+    MASE < 1  → better than naïve RW on training data.
+    Avoids near-zero denominator that breaks sMAPE on log-returns.
+    """
+    naive_mae = np.mean(np.abs(np.diff(y_train_ref)))   # MAE of in-sample RW
+    naive_mae = max(naive_mae, 1e-10)
+    return np.mean(np.abs(actual - forecast)) / naive_mae
 
 rows = []
 for model, fc in results_fc.items():
     fc = np.asarray(fc)
     rows.append({
-        "Model":    model,
-        "MAE":      mean_absolute_error(y_test, fc),
-        "RMSE":     np.sqrt(mean_squared_error(y_test, fc)),
-        "QLIKE":    qlike(y_test, fc),
-        "sMAPE(%)": smape(y_test, fc),
-        "TheilU2":  theil_u2(y_test, fc),
+        "Model":   model,
+        "MAE":     mean_absolute_error(y_test, fc),
+        "RMSE":    np.sqrt(mean_squared_error(y_test, fc)),
+        "QLIKE":   qlike(y_test, fc),
+        "MASE":    mase(y_test, fc, y_train),
+        "TheilU2": theil_u2(y_test, fc),
     })
 
 df_perf = pd.DataFrame(rows).set_index("Model").sort_values("RMSE")
@@ -800,60 +851,141 @@ N_BOOT     = 500
 ALPHA      = 0.05
 H_SCENARIO = 12
 
-def bootstrap_pi(y_tr, X_tr, X_te, n_boot=N_BOOT, alpha=ALPHA):
-    n = len(y_tr); block = max(int(np.ceil(n**0.25)), 1)
+# ── Student-t block bootstrap ─────────────────────────────────────────────────
+def fit_t_df(residuals):
+    """Fit Student-t degrees-of-freedom to residuals via MLE  (df > 2)."""
+    from scipy.special import gammaln
+    r = residuals / (residuals.std() + 1e-10)
+    def neg_ll(log_nu_m2):
+        nu = float(np.exp(log_nu_m2) + 2.0)
+        return -float(np.sum(
+            gammaln((nu+1)/2) - gammaln(nu/2)
+            - 0.5*np.log(np.pi*(nu-2))
+            - (nu+1)/2 * np.log(1.0 + r**2/(nu-2))
+        ))
+    res = optimize.minimize_scalar(neg_ll, bounds=(np.log(0.5), np.log(98)),
+                                   method="bounded")
+    return float(np.exp(res.x) + 2.0)
+
+
+def bootstrap_pi_t(y_tr, X_tr, X_te, n_boot=N_BOOT, alpha=ALPHA, rng_seed=42):
+    """
+    Block bootstrap with Student-t fat-tail correction.
+    Steps:
+      1. Fit OLS on train; compute in-sample residuals.
+      2. Fit Student-t df on residuals (MLE).
+      3. Each boot iteration:
+         a. Draw block-resampled residual indices (cube-root block length).
+         b. Draw iid t(df) noise; standardise both.
+         c. Blend: resid_boot = block_resid_std * sigma * (0.5 + 0.5*|t_noise|)
+            – preserves autocorrelation structure AND inflates tails.
+      4. PI = empirical 2.5th / 97.5th percentile across boot forecasts.
+    """
+    n     = len(y_tr)
+    block = max(int(np.ceil(n ** (1/3))), 3)   # cube-root block length
     fc_base = ols_pred(X_tr, y_tr, X_te)
     resid   = y_tr - ols_pred(X_tr, y_tr, X_tr)
-    boot_fc = np.zeros((n_boot, len(X_te)))
-    rng = np.random.default_rng(42)
+    sigma_r = resid.std() + 1e-10
+
+    # --- fit t-df on in-sample residuals ---
+    try:
+        df_t = max(fit_t_df(resid), 2.1)
+    except Exception:
+        df_t = 5.0
+    print(f"  [Bootstrap] Student-t df fitted on residuals = {df_t:.2f}  "
+          f"(block length = {block})")
+
+    rng      = np.random.default_rng(rng_seed)
+    boot_fc  = np.zeros((n_boot, len(X_te)))
+
     for b in range(n_boot):
+        # a. block-resample indices
         idx = []
         while len(idx) < n:
-            start = rng.integers(0, n - block + 1)
-            idx.extend(range(start, min(start + block, n)))
-        idx = np.array(idx[:n])
-        y_boot = ols_pred(X_tr, y_tr, X_tr) + resid[idx]
-        boot_fc[b] = ols_pred(X_tr, y_boot, X_te)
-    lo = np.percentile(boot_fc, 100*alpha/2,   axis=0)
-    hi = np.percentile(boot_fc, 100*(1-alpha/2), axis=0)
-    return fc_base, lo, hi
+            s = rng.integers(0, n - block + 1)
+            idx.extend(range(s, min(s + block, n)))
+        idx      = np.array(idx[:n])
+        resid_b  = resid[idx]
 
-print(f"Running {N_BOOT}-iteration block bootstrap ({int((1-ALPHA)*100)}% PI)...")
-fc_base_pi, pi_lo, pi_hi = bootstrap_pi(y_train, X_tr, X_te)
-print(f"  Mean PI width: {(pi_hi - pi_lo).mean():.6f}")
-print(f"  Coverage check: {np.mean((y_test >= pi_lo) & (y_test <= pi_hi))*100:.1f}%")
+        # b. draw t(df) noise, standardise both
+        t_noise = rng.standard_t(df=df_t, size=n)
+        t_noise = (t_noise  - t_noise.mean())  / (t_noise.std()  + 1e-10)
+        resid_b = (resid_b  - resid_b.mean())  / (resid_b.std()  + 1e-10)
 
-last_oil_price = df_raw["OIL"].iloc[n_train - 1]
+        # c. fat-tail blend: keep block autocorrelation + inflate extremes
+        resid_bt = resid_b * sigma_r * (0.5 + 0.5 * np.abs(t_noise))
 
+        y_boot      = ols_pred(X_tr, y_tr, X_tr) + resid_bt
+        boot_fc[b]  = ols_pred(X_tr, y_boot, X_te)
+
+    lo = np.percentile(boot_fc, 100 * alpha / 2,       axis=0)
+    hi = np.percentile(boot_fc, 100 * (1 - alpha / 2), axis=0)
+    return fc_base, lo, hi, df_t
+
+
+print(f"Running {N_BOOT}-iteration Student-t block bootstrap "
+      f"({int((1-ALPHA)*100)}% PI)...")
+fc_base_pi, pi_lo, pi_hi, df_t_boot = bootstrap_pi_t(y_train, X_tr, X_te)
+print(f"  Mean PI width : {(pi_hi - pi_lo).mean():.6f}")
+print(f"  Coverage check: "
+      f"{np.mean((y_test >= pi_lo) & (y_test <= pi_hi))*100:.1f}%")
+
+# ── Price conversion helper ───────────────────────────────────────────────────
 def log_ret_to_price(base_price, ret_fc):
     prices = [base_price]
     for r in ret_fc:
         prices.append(prices[-1] * np.exp(r))
     return np.array(prices[1:])
 
+# ── Scenario anchor: LAST date of training set ────────────────────────────────
+# This ensures the scenario price path starts exactly where the model
+# stops observing data, eliminating the train→test date gap that caused
+# the original Fig 6 to look like it was projected from 2021 instead of
+# the true train-end date.
+last_train_date = df_train.index[-1]
+last_oil_price  = df_raw.loc[last_train_date, "OIL"]
+future_dates    = pd.date_range(last_train_date,
+                                periods=H_SCENARIO + 1, freq="ME")[1:]
+
+print(f"\n  Scenario anchor : {last_train_date.date()}  "
+      f"(last training observation)")
+print(f"  Base oil price  : ${last_oil_price:.2f}/bbl")
+print(f"  Horizon         : {H_SCENARIO} months  "
+      f"({future_dates[0].date()} → {future_dates[-1].date()})")
+
+# ── Scenario shocks calibrated to GARCH-t conditional volatility ─────────────
+# Use the LAST conditional standard deviation from GARCH-t as the shock scale.
+# Bear  = −0.5 σ_t  (sustained negative monthly shock)
+# Base  = 0          (no additional shock beyond OLS forecast)
+# Bull  = +0.5 σ_t  (sustained positive monthly shock)
+garch_t_sigma = float(np.sqrt(max(h_garch_t[-1], 1e-9)))
+print(f"  GARCH-t last conditional σ = {garch_t_sigma:.4f}  "
+      f"(used to calibrate Bear/Bull shocks)")
+
 scenarios = {
-    "Bear": {"shock": -0.015, "vol_mult": 1.5,  "color": "#d62728"},
-    "Base": {"shock":  0.000, "vol_mult": 1.0,  "color": "#1f77b4"},
-    "Bull": {"shock": +0.015, "vol_mult": 0.75, "color": "#2ca02c"},
+    "Bear": {"shock": -garch_t_sigma * 0.50, "vol_mult": 1.5,  "color": "#d62728"},
+    "Base": {"shock":  0.000,                "vol_mult": 1.0,  "color": "#1f77b4"},
+    "Bull": {"shock": +garch_t_sigma * 0.50, "vol_mult": 0.75, "color": "#2ca02c"},
 }
 
-X_scenario = np.tile(X_te.mean(axis=0), (H_SCENARIO, 1))
-fc_scenario_base, sc_lo, sc_hi = bootstrap_pi(y_train, X_tr, X_scenario)
+X_scenario            = np.tile(X_te.mean(axis=0), (H_SCENARIO, 1))
+fc_scenario_base, sc_lo, sc_hi, _ = bootstrap_pi_t(y_train, X_tr, X_scenario)
 
-print(f"\n[Scenarios – {H_SCENARIO}-month horizon from last train date]")
-print(f"{'Scenario':<8} {'Start $':>9} {'End $':>9} {'Δ%':>7} {'Min $':>9} {'Max $':>9}")
+print(f"\n[Scenarios – {H_SCENARIO}-month horizon from {last_train_date.date()}]")
+print(f"{'Scenario':<8} {'Start $':>9} {'End $':>9} "
+      f"{'Δ%':>7} {'Min $':>9} {'Max $':>9}")
 print("-"*52)
 
 scenario_df_dict = {}
 for sc_name, sc_params in scenarios.items():
-    sc_ret = fc_scenario_base + sc_params["shock"]
-    sc_prices = log_ret_to_price(last_oil_price, sc_ret)
-    sc_vol  = (sc_hi - sc_lo) / 2 * sc_params["vol_mult"]
+    sc_ret       = fc_scenario_base + sc_params["shock"]
+    sc_prices    = log_ret_to_price(last_oil_price, sc_ret)
+    sc_vol       = (sc_hi - sc_lo) / 2 * sc_params["vol_mult"]
     sc_prices_lo = log_ret_to_price(last_oil_price, sc_ret - sc_vol)
     sc_prices_hi = log_ret_to_price(last_oil_price, sc_ret + sc_vol)
-    pct_chg = (sc_prices[-1] / last_oil_price - 1) * 100
-    print(f"{sc_name:<8} {last_oil_price:>9.2f} {sc_prices[-1]:>9.2f} {pct_chg:>7.1f}% "
-          f"{sc_prices.min():>9.2f} {sc_prices.max():>9.2f}")
+    pct_chg      = (sc_prices[-1] / last_oil_price - 1) * 100
+    print(f"{sc_name:<8} {last_oil_price:>9.2f} {sc_prices[-1]:>9.2f} "
+          f"{pct_chg:>7.1f}% {sc_prices.min():>9.2f} {sc_prices.max():>9.2f}")
     scenario_df_dict[sc_name] = {
         "prices": sc_prices, "lo": sc_prices_lo, "hi": sc_prices_hi,
         "ret": sc_ret, "shock": sc_params["shock"], "color": sc_params["color"]
@@ -961,36 +1093,61 @@ plt.tight_layout()
 plt.savefig(os.path.join(out_dir, "Fig3_Forecast_PI.png"), dpi=150, bbox_inches="tight")
 plt.close(); print("[Saved] Fig3_Forecast_PI.png")
 
-# ── Figure 5: Performance bar ─────────────────────────────────────────────────
-fig4, axes = plt.subplots(1, 4, figsize=(18, 6))
+# ── Figure 5: Performance bar  (5 metrics incl. MASE) ───────────────────────
+fig4, axes = plt.subplots(1, 5, figsize=(22, 6))
 fig4.suptitle("Forecast Performance – All Models", fontsize=13, fontweight="bold")
 bc = [PALETTE[i % len(PALETTE)] for i in range(len(df_perf))]
-for ax, metric in zip(axes, ["MAE", "RMSE", "QLIKE", "TheilU2"]):
+metric_labels = {
+    "MAE":     "MAE",
+    "RMSE":    "RMSE",
+    "QLIKE":   "QLIKE",
+    "MASE":    "MASE  (< 1 = beats naïve RW)",
+    "TheilU2": "TheilU2  (< 1 = beats naïve RW)",
+}
+for ax, metric in zip(axes, ["MAE", "RMSE", "QLIKE", "MASE", "TheilU2"]):
     vals = df_perf[metric]
     bars = ax.barh(df_perf.index, vals, color=bc, edgecolor="white")
-    ax.set_title(metric); ax.invert_yaxis()
-    if metric == "TheilU2":
-        ax.axvline(1.0, color="red", ls="--", lw=1.2, label="Naive (U2=1)")
-        ax.legend(fontsize=8)
+    ax.set_title(metric_labels[metric], fontsize=9); ax.invert_yaxis()
+    if metric in ("TheilU2", "MASE"):
+        ax.axvline(1.0, color="red", ls="--", lw=1.2, label="= 1 (naïve RW)")
+        ax.legend(fontsize=7)
     for bar, v in zip(bars, vals):
-        ax.text(v*1.01, bar.get_y()+bar.get_height()/2, f"{v:.4f}", va="center", fontsize=7)
+        ax.text(v * 1.01, bar.get_y() + bar.get_height() / 2,
+                f"{v:.4f}", va="center", fontsize=7)
 plt.tight_layout()
 plt.savefig(os.path.join(out_dir, "Fig4_Performance.png"), dpi=150, bbox_inches="tight")
 plt.close(); print("[Saved] Fig4_Performance.png")
 
-# ── Figure 6: GARCH(1,1) volatility ──────────────────────────────────────────
-fig5, axes = plt.subplots(1, 2, figsize=(15, 5))
-fig5.suptitle("Conditional Volatility – GARCH(1,1)", fontsize=13, fontweight="bold")
-cv_g = np.sqrt(np.maximum(h_garch, 0))
+# ── Figure 6: GARCH(1,1) Normal vs GARCH-t conditional volatility ────────────
+fig5, axes = plt.subplots(1, 3, figsize=(20, 5))
+fig5.suptitle(
+    f"Conditional Volatility – GARCH(1,1) Normal vs GARCH(1,1)-t\n"    f"GARCH-t df(ν) = {nu_gt:.2f}  |  "    f"persist(Normal) = {al_g[0]+be_g[0]:.4f}  "    f"persist(t) = {al_gt[0]+be_gt[0]:.4f}",
+    fontsize=11, fontweight="bold"
+)
+cv_g  = np.sqrt(np.maximum(h_garch,   0))   # Normal
+cv_gt = np.sqrt(np.maximum(h_garch_t, 0))   # Student-t
 
-axes[0].plot(df_train.index, cv_g, color="#1f77b4", lw=1.)
-axes[0].set_title("GARCH(1,1) – Conditional Volatility (Train)")
+# Panel 1: GARCH Normal volatility
+axes[0].plot(df_train.index, cv_g, color="#1f77b4", lw=1.2)
+axes[0].set_title("GARCH(1,1) Normal – Conditional σ (Train)")
 axes[0].set_ylabel("Conditional Std Dev")
 
-axes[1].plot(df_train.index, df_train["OIL_RET"].values, color="gray", lw=0.7, alpha=0.6, label="OIL_RET")
-axes[1].plot(df_train.index, cv_g, color="#1f77b4", lw=1.2, label="GARCH(1,1) vol")
-axes[1].set_title("OIL_RET + GARCH(1,1) Volatility")
+# Panel 2: GARCH-t volatility
+axes[1].plot(df_train.index, cv_gt, color="#e6550d", lw=1.2,
+             label=f"GARCH-t  ν={nu_gt:.1f}")
+axes[1].set_title("GARCH(1,1)-t – Conditional σ (Train)")
 axes[1].legend(fontsize=8)
+
+# Panel 3: Overlay – Normal vs t, with OIL_RET returns
+ax3 = axes[2]
+ax3.plot(df_train.index, df_train["OIL_RET"].values,
+         color="gray", lw=0.6, alpha=0.5, label="OIL_RET")
+ax3.plot(df_train.index, cv_g,  color="#1f77b4", lw=1.4,
+         label=f"GARCH Normal  α={al_g[0]:.3f} β={be_g[0]:.3f}")
+ax3.plot(df_train.index, cv_gt, color="#e6550d", lw=1.4, ls="--",
+         label=f"GARCH-t  α={al_gt[0]:.3f} β={be_gt[0]:.3f}  ν={nu_gt:.1f}")
+ax3.set_title("OIL_RET + GARCH Normal vs GARCH-t")
+ax3.legend(fontsize=7.5)
 
 for ax in axes:
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
@@ -1001,31 +1158,49 @@ plt.savefig(os.path.join(out_dir, "Fig5_GARCH_Vol.png"), dpi=150, bbox_inches="t
 plt.close(); print("[Saved] Fig5_GARCH_Vol.png")
 
 # ── Figure 7: Scenarios Bull/Base/Bear ───────────────────────────────────────
-fig6, axes = plt.subplots(1, 2, figsize=(15, 6))
-fig6.suptitle("Bull / Base / Bear Price Scenarios – Brent Crude Oil",
-              fontsize=13, fontweight="bold")
-future_dates = pd.date_range(df_train.index[-1], periods=H_SCENARIO+1, freq="ME")[1:]
+# future_dates and last_train_date are already defined in Part 10.
+# Show 36 months of history so the historical→forecast transition is clear.
+fig6, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig6.suptitle(
+    f"Bull / Base / Bear Price Scenarios – Brent Crude Oil\n"    f"Anchored at train-end: {last_train_date.date()}  "    f"(${last_oil_price:.1f}/bbl)  |  Horizon: {H_SCENARIO} months",
+    fontsize=12, fontweight="bold"
+)
 
 ax_l = axes[0]
 ax_r = axes[1]
-hist_prices = df_raw["OIL"].iloc[max(0, n_train-24):n_train]
-ax_l.plot(hist_prices.index, hist_prices.values, color="black", lw=1.5, label="Historical")
-ax_r.plot(hist_prices.index, hist_prices.values, color="black", lw=1.5, label="Historical")
+
+# 36-month history window ending exactly at last_train_date
+hist_prices = df_raw["OIL"].loc[
+    (df_raw.index >= last_train_date - pd.DateOffset(months=36)) &
+    (df_raw.index <= last_train_date)
+]
+for ax in [ax_l, ax_r]:
+    ax.plot(hist_prices.index, hist_prices.values,
+            color="black", lw=1.8, label="Historical", zorder=3)
+    # vertical marker at anchor date
+    ax.axvline(last_train_date, color="gray", ls="--", lw=1,
+               label=f"Train end ({last_train_date.strftime('%Y-%m')})")
 
 for sc_name, sc_data in scenario_df_dict.items():
     c = sc_data["color"]
-    ax_l.plot(future_dates, sc_data["prices"], color=c, lw=2, label=sc_name)
-    ax_r.plot(future_dates, sc_data["prices"], color=c, lw=2, label=sc_name)
-    ax_r.fill_between(future_dates, sc_data["lo"], sc_data["hi"], alpha=0.15, color=c)
+    shock_label = (f"{sc_name}  "
+                   f"(shock={sc_data['shock']:+.4f}/mo, "                   f"end=${sc_data['prices'][-1]:.1f})")
+    ax_l.plot(future_dates, sc_data["prices"], color=c, lw=2.2, label=shock_label)
+    ax_r.plot(future_dates, sc_data["prices"], color=c, lw=2.2, label=shock_label)
+    ax_r.fill_between(future_dates, sc_data["lo"], sc_data["hi"],
+                      alpha=0.18, color=c)
 
 for ax in [ax_l, ax_r]:
-    ax.set_title("Price Scenarios" if ax == ax_l else "Price Scenarios + PI")
-    ax.set_ylabel("Brent Crude ($/bbl)"); ax.legend(fontsize=9)
+    ax.set_title("Price Scenarios" if ax == ax_l else "Price Scenarios + 95% PI (Student-t Bootstrap)")
+    ax.set_ylabel("Brent Crude ($/bbl)")
+    ax.legend(fontsize=8, loc="upper left")
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right")
+
 plt.tight_layout()
-plt.savefig(os.path.join(out_dir, "Fig6_Scenarios_Bull_Base_Bear.png"), dpi=150, bbox_inches="tight")
+plt.savefig(os.path.join(out_dir, "Fig6_Scenarios_Bull_Base_Bear.png"),
+            dpi=150, bbox_inches="tight")
 plt.close(); print("[Saved] Fig6_Scenarios_Bull_Base_Bear.png")
 
 # ── Figure 8: Walk-forward rolling RMSE ──────────────────────────────────────
@@ -1054,7 +1229,7 @@ for w, (tr_end, te_start, te_end) in enumerate(rolling_windows):
     except: roll_rmse["ARIMA"].append(np.nan)
     # GARCH(1,1)
     try:
-        mu_gw, _, _, _, _, _ = garch_fit_fn(y_tr_w, 1, 1)
+        mu_gw, _, _, _, _, _ = garch_fit_fn(y_tr_w, 1, 1, dist="normal")
         fc_g_w = np.full(h_w, mu_gw)
         roll_rmse["GARCH(1,1)"].append(np.sqrt(mean_squared_error(y_te_w, fc_g_w)))
     except: roll_rmse["GARCH(1,1)"].append(np.nan)
@@ -1143,9 +1318,15 @@ dummy_summary = pd.DataFrame([
 # Forecasts
 fc_out = pd.DataFrame(results_fc, index=df_test.index)
 fc_out.insert(0, "Actual", y_test)
-fc_out["GARCH_Vol_Forecast"] = garch_vol_fc
-fc_out["Bootstrap_PI_Lo"]    = pi_lo
-fc_out["Bootstrap_PI_Hi"]    = pi_hi
+# GARCH-t conditional vol forecast (multi-step, same function as Normal)
+garch_t_var_fc = garch_variance_forecast(h_garch_t, e_garch_t,
+                                         om_gt, al_gt, be_gt, len(y_test))
+garch_t_vol_fc = np.sqrt(np.maximum(garch_t_var_fc, 0))
+fc_out["GARCH_Vol_Normal"]    = garch_vol_fc
+fc_out["GARCH_Vol_t"]         = garch_t_vol_fc
+fc_out["Bootstrap_PI_Lo"]     = pi_lo
+fc_out["Bootstrap_PI_Hi"]     = pi_hi
+print(f"  GARCH-t mean conditional vol (test): {garch_t_vol_fc.mean():.6f}  "      f"vs Normal: {garch_vol_fc.mean():.6f}")
 
 # Scenarios sheet
 sc_rows = []
@@ -1168,7 +1349,7 @@ df_rolling.index.name = "Window"
 
 # Overall ranking
 df_rank = df_perf.copy()
-for col in ["MAE","RMSE","QLIKE","sMAPE(%)","TheilU2"]:
+for col in ["MAE", "RMSE", "QLIKE", "MASE", "TheilU2"]:
     df_rank[f"rank_{col}"] = df_perf[col].rank()
 rank_cols = [c for c in df_rank.columns if c.startswith("rank_")]
 df_rank["avg_rank"] = df_rank[rank_cols].mean(axis=1)
@@ -1185,7 +1366,7 @@ with pd.ExcelWriter(out_xl, engine="openpyxl") as w:
     dummy_summary.to_excel(w, sheet_name="Dummy_Variables",    index=False)
     fc_out.to_excel(w, sheet_name="Forecasts")
     df_perf.round(6).to_excel(w, sheet_name="Performance_Metrics")
-    df_rank[["avg_rank","MAE","RMSE","QLIKE","sMAPE(%)","TheilU2"]]\
+    df_rank[["avg_rank", "MAE", "RMSE", "QLIKE", "MASE", "TheilU2"]]\
         .round(6).to_excel(w, sheet_name="Overall_Ranking")
     df_dm.to_excel(w, sheet_name="DM_Test",                    index=False)
     df_scenarios_pi.to_excel(w, sheet_name="Scenarios_PI",     index=False)
@@ -1212,10 +1393,14 @@ print(f"  Phase 4 : Descriptive stats + Jarque-Bera normality test")
 print(f"  Phase 5 : ARCH-LM + ACF/PACF (Yule-Walker) + Ljung-Box")
 print(f"  Phase 6 : PLS dimension reduction ({N_COMP} components)")
 print(f"  Phase 7 : Train/test split + Walk-forward rolling ({N_WINDOWS} windows)")
-print(f"  Phase 8 : 7 models → OLS | PLS | ARIMA(1,0,1) | SARIMA(1,0,1)(1,0,1,12)")
-print(f"            ARCH(1) | GARCH(1,1) | OLS+Dummy(GFC/COVID/Ukraine)")
-print(f"  Phase 9 : Metrics (MAE/RMSE/QLIKE/sMAPE/TheilU2) + Diebold-Mariano test")
-print(f"  Phase 10: Bootstrap PI ({N_BOOT} iter) + Bull/Base/Bear scenarios ({H_SCENARIO}m)")
+print(f"  Phase 8 : 8 models → OLS | PLS | ARIMA(1,0,1) | SARIMA(1,0,1)(1,0,1,12)")
+print(f"            ARCH(1) | GARCH(1,1)-Normal | GARCH(1,1)-t | OLS+Dummy")
+print(f"            GARCH-t df(ν) fitted = {nu_gt:.2f}")
+print(f"  Phase 9 : Metrics (MAE/RMSE/QLIKE/MASE/TheilU2) + Diebold-Mariano test")
+print(f"            [sMAPE replaced by MASE – avoids near-zero denom on log-returns]")
+print(f"  Phase 10: Student-t block bootstrap PI ({N_BOOT} iter, df={df_t_boot:.2f})")
+print(f"            Bull/Base/Bear anchored at {last_train_date.date()}, "
+      f"shock=GARCH-t σ={garch_t_sigma:.4f}")
 print(f"  Phase 11: 7 figures + Excel with 14 sheets incl. Dummy_Variables sheet")
 
 print(f"\n{'='*50}")
