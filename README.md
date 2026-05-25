@@ -79,7 +79,11 @@ FINAL/
 | 5 | ARCH(1) | 0.0811 | 0.0628 | 0.7378 |
 | 6–8 | OLS / PLS / OLS+Dummy | ~0.094 | ~0.074 | ~0.855 |
 
+<<<<<<< HEAD
 > 
+=======
+
+>>>>>>> 5c416343c24c9ef599ff506f509d09bfc4817b04
 ### Key Findings
 
 - All 5 variables are **I(1)** at level → **I(0)** after log-return
